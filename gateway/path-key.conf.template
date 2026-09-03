@@ -1,0 +1,48 @@
+# Keyed-path entrypoint. Rendered into /etc/nginx/path-key.conf only when
+# PATH_KEY_AUTH is enabled; otherwise that file is left empty.
+#
+# Some MCP clients enumerate a server's tools before they have anywhere to put
+# a credential, so their discovery request carries no Authorization header and
+# takes a 401 from `location /`. This block accepts the same key as the first
+# path segment instead, validates it against the identical ${API_KEY_PATTERN},
+# and then behaves exactly like /mcp. Nothing is opened up: an absent or wrong
+# key still gets 401, and a valid key unlocks no path but /mcp.
+#
+# The trade-off is that the key travels in the URL, where it can land in edge
+# and proxy logs. Issue a SEPARATE key in API_KEYS for any client that uses
+# this path so it can be rotated on its own, and prefer the header form
+# everywhere else. access_log is off here so the gateway records nothing.
+#
+# The path-key charset deliberately excludes "/" (which the header form
+# allows) because a slash would split the path segment.
+location ~ "^/k/(?<path_key>[A-Za-z0-9._~+=-]+)/mcp/?$" {
+  access_log off;
+
+  if ($path_key !~ "^(${API_KEY_PATTERN})$") {
+    add_header Content-Type 'application/json' always;
+    return 401 '{"error":"unauthorized"}';
+  }
+
+  set $upstream "http://${MCP_HOST}:${MCP_PORT}";
+
+  proxy_http_version 1.1;
+  proxy_set_header Connection "";
+
+  # Long-lived streaming responses.
+  proxy_buffering off;
+  proxy_cache off;
+  proxy_read_timeout 1h;
+  proxy_send_timeout 1h;
+
+  proxy_set_header Host "127.0.0.1:${MCP_PORT}";
+  proxy_set_header X-Forwarded-Host $host;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+
+  # A keyed-path request carries no Authorization header, so the upstream
+  # credential has to come from here when MCP_SERVER_TOKEN is set.
+  ${MCP_AUTH_HEADER}
+
+  # Strip the key segment; the upstream only ever sees /mcp.
+  proxy_pass $upstream/mcp$is_args$args;
+}

@@ -1,0 +1,89 @@
+worker_processes auto;
+events { worker_connections 256; }
+
+http {
+  resolver ${RESOLVER} ipv6=on valid=10s;
+  resolver_timeout 5s;
+
+  map $http_authorization $auth_ok {
+    default 0;
+    "~^Bearer (${API_KEY_PATTERN})$" 1;
+  }
+
+  server {
+    listen ${PORT};
+    client_max_body_size 16m;
+
+    # Gateway-side health for Railway probes — no proxy, no auth.
+    location = /health {
+      access_log off;
+      return 200 "ok\n";
+    }
+
+    # Same thing under the other common spelling, so a healthcheck path
+    # configured either way works without editing this file.
+    location = /healthz {
+      access_log off;
+      return 200 "ok\n";
+    }
+
+    # Return JSON 404 on OAuth discovery probes so clients fall back to bearer
+    # auth. Regex catches every variant (bare, /.well-known/.../mcp, /mcp/.well-known/...).
+    location ~ /\.well-known/ {
+      access_log off;
+      default_type application/json;
+      return 404 '{"error":"not_found"}';
+    }
+    location = /register {
+      access_log off;
+      default_type application/json;
+      return 404 '{"error":"not_found"}';
+    }
+
+    # Keyed-path entrypoint, rendered only when PATH_KEY_AUTH is enabled;
+    # otherwise this file is empty. See docker-entrypoint.d/10-render-config.sh.
+    include /etc/nginx/path-key.conf;
+
+    location / {
+      if ($auth_ok = 0) {
+        add_header WWW-Authenticate 'Bearer realm="grafana-mcp"' always;
+        add_header Content-Type 'application/json' always;
+        return 401 '{"error":"unauthorized"}';
+      }
+
+      # `set` must precede `rewrite ... break` — `break` halts later rewrite-phase
+      # directives, leaving $upstream empty and breaking proxy_pass.
+      set $upstream "http://${MCP_HOST}:${MCP_PORT}";
+
+      # mcp-grafana serves the streamable-HTTP endpoint at exactly /mcp; strip a
+      # trailing slash rather than let the upstream redirect (some clients drop
+      # Authorization on redirect).
+      rewrite ^/mcp/$ /mcp break;
+
+      proxy_http_version 1.1;
+      proxy_set_header Connection "";
+
+      # Long-lived streaming responses.
+      proxy_buffering off;
+      proxy_cache off;
+      proxy_read_timeout 1h;
+      proxy_send_timeout 1h;
+
+      # mcp-grafana rejects (403) any Host outside --allowed-hosts, which the
+      # mcp entrypoint sets to the loopback variants of its own port. Bearer
+      # auth here is the real security boundary.
+      proxy_set_header Host "127.0.0.1:${MCP_PORT}";
+      proxy_set_header X-Forwarded-Host $host;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
+
+      # Replaces the client's Authorization header with the mcp service's own
+      # credential when MCP_SERVER_TOKEN is set, so gateway keys can be rotated
+      # without touching the mcp service. Empty otherwise, and nginx forwards
+      # the client's header unchanged.
+      ${MCP_AUTH_HEADER}
+
+      proxy_pass $upstream$uri$is_args$args;
+    }
+  }
+}

@@ -1,0 +1,146 @@
+# Builds both images this template ships (gateway and mcp) on every PR and on
+# main, and exercises the gateway's runtime-rendered nginx config.
+name: docker-build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [gateway, mcp]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build ${{ matrix.image }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.image }}
+          push: false
+          load: false
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  # The gateway's nginx config is rendered at container start, not at build
+  # time, so a broken template passes the image build and only fails once it
+  # reaches Railway. This job starts the real image and asserts the routing
+  # and auth behaviour the gateway is responsible for.
+  gateway-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build gateway image locally
+        uses: docker/build-push-action@v6
+        with:
+          context: gateway
+          push: false
+          load: true
+          tags: gateway:ci
+          cache-from: type=gha,scope=gateway
+
+      - name: Start stub upstream
+        run: |
+          docker network create ci-net
+          mkdir -p stub
+          # The real upstream answers on /mcp, so the stub must too. Serving
+          # only / would make every proxied request 404 and the assertions
+          # below would be testing nothing.
+          printf 'upstream root\n' > stub/index.html
+          printf 'upstream mcp\n' > stub/mcp
+          docker run -d --name mcp --network ci-net \
+            -v "$PWD/stub:/usr/share/nginx/html:ro" \
+            nginx:1.29.8-alpine
+
+      - name: Start gateway with the keyed path enabled
+        run: |
+          docker run -d --name gw --network ci-net \
+            -e API_KEYS=goodkeyone,goodkeytwo \
+            -e PATH_KEY_AUTH=true \
+            -e MCP_HOST=mcp \
+            -e MCP_PORT=80 \
+            -e PORT=8080 \
+            -p 8080:8080 gateway:ci
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:8080/healthz >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS http://localhost:8080/healthz >/dev/null
+
+      - name: nginx config is valid
+        run: docker exec gw nginx -t
+
+      - name: Assertions
+        run: |
+          set -eu
+          code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+
+          echo "both health spellings are open"
+          [ "$(code http://localhost:8080/health)" = 200 ]
+          [ "$(code http://localhost:8080/healthz)" = 200 ]
+
+          echo "bare /mcp with no credential is rejected"
+          [ "$(code http://localhost:8080/mcp)" = 401 ]
+
+          echo "bare /mcp with a bad bearer is rejected"
+          [ "$(code -H 'Authorization: Bearer nope' http://localhost:8080/mcp)" = 401 ]
+
+          echo "bare /mcp with a good bearer reaches the upstream"
+          [ "$(code -H 'Authorization: Bearer goodkeyone' http://localhost:8080/mcp)" = 200 ]
+          curl -s -H 'Authorization: Bearer goodkeyone' http://localhost:8080/mcp | grep -q 'upstream mcp'
+
+          echo "keyed path with no key at all is rejected"
+          [ "$(code http://localhost:8080/k//mcp)" = 401 ]
+
+          echo "keyed path with a bad key is rejected"
+          [ "$(code http://localhost:8080/k/nope/mcp)" = 401 ]
+
+          echo "keyed path with a good key reaches the upstream"
+          [ "$(code http://localhost:8080/k/goodkeytwo/mcp)" = 200 ]
+
+          echo "keyed path lands on /mcp upstream, not on the key segment"
+          curl -s http://localhost:8080/k/goodkeytwo/mcp | grep -q 'upstream mcp'
+
+          echo "a valid key does not unlock any other path"
+          [ "$(code http://localhost:8080/k/goodkeyone/tools)" = 401 ]
+          [ "$(code http://localhost:8080/k/goodkeyone/)" = 401 ]
+
+      - name: Keyed path is off by default
+        run: |
+          set -eu
+          code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+
+          docker run -d --name gw-default --network ci-net \
+            -e API_KEYS=goodkeyone \
+            -e MCP_HOST=mcp \
+            -e MCP_PORT=80 \
+            -e PORT=8080 \
+            -p 8081:8080 gateway:ci
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:8081/healthz >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          echo "the empty include still yields a valid config"
+          docker exec gw-default nginx -t
+
+          echo "a good key in the path is rejected when PATH_KEY_AUTH is unset"
+          [ "$(code http://localhost:8081/k/goodkeyone/mcp)" = 401 ]
+
+          echo "the header form is unaffected"
+          [ "$(code -H 'Authorization: Bearer goodkeyone' http://localhost:8081/mcp)" = 200 ]
+
+      - name: Gateway logs on failure
+        if: failure()
+        run: |
+          docker logs gw || true
+          docker logs gw-default || true
