@@ -44,6 +44,39 @@ The gateway talks to Grafana through nothing but the mcp service, and the mcp se
      -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
    ```
 
+## 🧱 Infrastructure as Code
+
+`.railway/railway.ts` defines the whole project — both services and every variable.
+
+```bash
+railway link
+npm install
+
+# First apply only; later runs omit these and preserve() keeps the values.
+export API_KEYS=$(openssl rand -hex 32)
+export GRAFANA_URL=http://grafana.railway.internal:3000
+export GRAFANA_SERVICE_ACCOUNT_TOKEN=glsa_...
+
+npm run plan     # read the diff before applying
+npm run apply
+railway domain --service grafana-mcp-gateway
+```
+
+Give the domain to the gateway only. `grafana-mcp` holds your Grafana credentials and must
+stay private, read-only mode or not.
+
+Needs the Railway CLI 5.42.1 or newer: the IaC engine ships in the CLI, not in the npm
+package. If you forked this repo, change `REPO` in `railway.ts` to your own before applying.
+
+Link it to a project dedicated to this template. An apply deletes every resource **and
+every variable** the file does not declare, so from then on variables live in `railway.ts`,
+not the dashboard. Do not point it at a project created from the deploy button — the
+service names differ, and a mismatch is a delete and recreate, not a rename.
+
+## ⬆️ Upgrading
+
+Railway template updates are opt-in — an existing deployment keeps running until you apply the update. See the [changelog](CHANGELOG.md) for what each update contains.
+
 ## 🔧 Variables
 
 ### Gateway service
