@@ -7,16 +7,16 @@ Deploys [mcp-grafana](https://github.com/grafana/mcp-grafana) — Grafana's offi
 ## 🏗️ Architecture
 
 ```
-client ──Authorization: Bearer <key>──► gateway (nginx, public)
+client ──Authorization: Bearer <key>──► grafana-mcp-gateway (nginx, public)
                                               │
                                               ▼ private network
-                                     mcp (mcp-grafana, private) ──► Grafana
+                                 grafana-mcp (private) ──► Grafana
 ```
 
 Two Railway services:
 
-- **`gateway`** — `nginx:alpine`, exposes a public domain, validates the `Authorization: Bearer <key>` header against `API_KEYS`, and forwards streamable-HTTP traffic to the mcp service via Railway's private network.
-- **`mcp`** — the official `grafana/mcp-grafana` image at a pinned tag, run with `--transport=streamable-http`. **Do not give this service a public domain**; it is only reachable at `grafana-mcp.railway.internal:8000`.
+- **`grafana-mcp-gateway`** — `nginx:1.29.8-alpine`, exposes a public domain, validates the `Authorization: Bearer <key>` header against `API_KEYS`, and forwards streamable-HTTP traffic to the mcp service via Railway's private network.
+- **`grafana-mcp`** — the official `grafana/mcp-grafana` image at a pinned tag, run with `--transport=streamable-http`. **Do not give this service a public domain**; it is only reachable at `grafana-mcp.railway.internal:8000`.
 
 The gateway talks to Grafana through nothing but the mcp service, and the mcp service reaches Grafana over `GRAFANA_URL` — point that at your Grafana's private endpoint so Grafana itself never needs to be public either.
 
