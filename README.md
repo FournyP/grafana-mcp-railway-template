@@ -43,6 +43,11 @@ The gateway talks to Grafana through nothing but the mcp service, and the mcp se
      -H "Accept: application/json, text/event-stream" \
      -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
    ```
+   With Claude Code:
+   ```bash
+   claude mcp add grafana --transport http https://<gateway-domain>/mcp \
+     --header "Authorization: Bearer <your-key>"
+   ```
 
 ## 🧱 Infrastructure as Code
 
