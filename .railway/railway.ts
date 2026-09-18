@@ -65,6 +65,10 @@ export default defineRailway(() => {
       healthcheckPath: "/health",
     },
     env: {
+      // nginx listens here. Pinned so the domain's target port and the port
+      // Railway dials cannot disagree, which reads as "connection refused".
+      PORT: "80",
+
       // Comma-separated bearer tokens. Per key: A-Z a-z 0-9 . _ ~ + / = -
       API_KEYS: fromEnvOrPreserve("API_KEYS"),
 

@@ -4,6 +4,14 @@ Notable changes to this template. Entries are named after the mcp-grafana versio
 ship, or after the change itself when a release only touches this template. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Pinned gateway port — 2026-09-18
+
+### Fixed
+
+- `railway.ts` pins the gateway's `PORT` to `80`. Railway injects a random `PORT` when the
+  variable is unset, so a gateway created by hand with an explicit domain target port
+  listened on one port while the edge dialled another, and every request was a `502`.
+
 ## Exact key matching — 2026-09-18
 
 ### Fixed

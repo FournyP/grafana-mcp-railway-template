@@ -145,6 +145,7 @@ A third layer is available: set `MCP_GRAFANA_SERVER_TOKEN` on the mcp service an
 - **`/health` and `/healthz` are unauthenticated** so Railway (and any uptime monitor) can probe without a token. Everything else requires `Authorization: Bearer <key>`.
 - **Invalid / missing token:** the gateway returns `401` with a `WWW-Authenticate: Bearer realm="grafana-mcp"` header.
 - **Do not expose the mcp service publicly.** All traffic should enter through the gateway.
+- **Gateway port:** nginx listens on `PORT`, which the IaC file pins to `80`. Railway injects a random `PORT` when the variable is unset, so if you create the gateway by hand and give its domain an explicit target port, set `PORT` to match or the edge gets `connection refused`.
 - **`Origin` headers are rejected** by mcp-grafana by default, so browser-based clients cannot call this server directly. That is upstream's anti-DNS-rebinding default, not a gateway setting.
 - Upstream source: https://github.com/grafana/mcp-grafana — pinned via the tag in `mcp/Dockerfile`. Bump it to pick up upstream changes.
 
