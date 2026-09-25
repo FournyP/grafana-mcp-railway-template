@@ -1,4 +1,4 @@
-FROM nginx:1.29.8-alpine
+FROM nginx:1.31.6-alpine
 
 COPY ./nginx.conf.template /etc/nginx/nginx.conf.template
 COPY ./path-key.conf.template /etc/nginx/path-key.conf.template
