@@ -25,11 +25,6 @@
       "matchUpdateTypes": ["minor"],
       "matchCurrentVersion": "/^v?0\\./",
       "automerge": false
-    },
-    {
-      "description": "CI builds the mcp image but never boots it, so its updates need a human.",
-      "matchPackageNames": ["grafana/mcp-grafana"],
-      "automerge": false
     }
   ]
 }

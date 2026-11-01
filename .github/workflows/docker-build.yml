@@ -1,5 +1,6 @@
 # Builds both images this template ships (gateway and mcp) on every PR and on
-# main, and exercises the gateway's runtime-rendered nginx config.
+# main, boots the mcp server against a local Grafana, and exercises the
+# gateway's runtime-rendered nginx config.
 name: docker-build
 
 on:
@@ -28,6 +29,158 @@ jobs:
           load: false
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  # A successful image build says nothing about the pinned mcp-grafana release
+  # starting with the flags the entrypoint passes, or still talking to Grafana,
+  # so this job boots the real mcp image against a local Grafana and drives it
+  # over MCP: search a dashboard, list a datasource, and check both auth methods
+  # and both access modes reach Grafana as the expected identity.
+  mcp-boot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build mcp image locally
+        uses: docker/build-push-action@v7
+        with:
+          context: mcp
+          push: false
+          load: true
+          tags: mcp:ci
+          cache-from: type=gha,scope=mcp
+
+      - name: Start Grafana with a dashboard, a datasource and a service account
+        run: |
+          set -eu
+          docker network create ci-net
+          docker run -d --name grafana --network ci-net \
+            -e GF_SECURITY_ADMIN_PASSWORD=ciadminpass \
+            -p 3000:3000 grafana/grafana:13.3.0
+          # /api/health turns green before the admin user exists, so wait on
+          # an authenticated endpoint instead.
+          for i in $(seq 1 60); do
+            curl -fsS -u admin:ciadminpass http://localhost:3000/api/user >/dev/null 2>&1 && break
+            sleep 1
+          done
+          api() {
+            curl -fsS -u admin:ciadminpass -H 'Content-Type: application/json' \
+              "http://localhost:3000$1" -d "$2"
+          }
+          api /api/dashboards/db '{"dashboard":{"title":"CI Boot Dashboard","panels":[]}}'
+          api /api/datasources '{"name":"ci-prometheus","type":"prometheus","access":"proxy","url":"http://prometheus.invalid:9090"}'
+          # The template recommends a service account token, so the main
+          # server authenticates with one. Viewer is all a read-only server needs.
+          sa=$(api /api/serviceaccounts '{"name":"ci-mcp","role":"Viewer"}' | jq -r .id)
+          api "/api/serviceaccounts/$sa/tokens" '{"name":"ci"}' | jq -r .key > sa-token
+          [ -s sa-token ] && [ "$(cat sa-token)" != null ]
+
+      - name: Start mcp
+        run: |
+          set -eu
+          # The default configuration: service account token, restricted
+          # access, and the second auth layer on. Port 8000 on both sides, as
+          # the entrypoint only admits a Host header of localhost:${PORT}.
+          docker run -d --name mcp --network ci-net \
+            -e GRAFANA_URL=http://grafana:3000 \
+            -e GRAFANA_SERVICE_ACCOUNT_TOKEN="$(cat sa-token)" \
+            -e MCP_GRAFANA_SERVER_TOKEN=ciservertoken \
+            -e GRAFANA_USAGE_STATS=disabled \
+            -e PORT=8000 \
+            -p 8000:8000 mcp:ci
+          # The other entrypoint branches: basic auth and unrestricted access.
+          docker run -d --name mcp-basic --network ci-net \
+            -e GRAFANA_URL=http://grafana:3000 \
+            -e GRAFANA_USERNAME=admin \
+            -e GRAFANA_PASSWORD=ciadminpass \
+            -e ACCESS_MODE=unrestricted \
+            -e GRAFANA_USAGE_STATS=disabled \
+            -e PORT=8001 \
+            -p 8001:8001 mcp:ci
+          for port in 8000 8001; do
+            for i in $(seq 1 30); do
+              curl -fsS "http://localhost:$port/healthz" >/dev/null 2>&1 && break
+              sleep 1
+            done
+            curl -fsS "http://localhost:$port/healthz" >/dev/null
+          done
+
+      - name: Assertions
+        run: |
+          set -euo pipefail
+          # A response is either plain JSON or SSE; keep only the JSON of the
+          # data lines in the SSE case. Each body is echoed so a failed grep
+          # shows what the server actually said. mcp-grafana runs stateless and
+          # sends no session id, so none is carried between calls.
+          call() {
+            body=$(curl -sS -X POST "http://localhost:$1/mcp" \
+              -H 'Authorization: Bearer ciservertoken' \
+              -H 'Content-Type: application/json' \
+              -H 'Accept: application/json, text/event-stream' \
+              -d "$2")
+            if printf '%s\n' "$body" | grep -q '^data: '; then
+              body=$(printf '%s\n' "$body" | sed -n 's/^data: //p')
+            fi
+            printf '%s\n' "$body" | tee -a responses.log
+          }
+          # Calls a tool and prints its text result. A failed call still
+          # answers 200, so isError is checked explicitly.
+          tool() {
+            args=${3:-'{}'}
+            out=$(call "$1" "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"$2\",\"arguments\":$args}}")
+            if [ "$(printf '%s\n' "$out" | jq -r '.result.isError // false')" != false ]; then
+              echo "$2 returned an error" >&2
+              return 1
+            fi
+            printf '%s\n' "$out" | jq -r '.result.content[0].text'
+          }
+          code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+
+          echo "a caller without the server token is rejected"
+          [ "$(code -X POST http://localhost:8000/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')" = 401 ]
+
+          echo "initialize succeeds"
+          call 8000 '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            | grep -q '"serverInfo"'
+
+          echo "read tools are listed and write tools are not"
+          tools=$(call 8000 '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | jq -r '.result.tools[].name')
+          for t in search_dashboards list_datasources user_info; do
+            echo "$tools" | grep -qx "$t"
+          done
+          if echo "$tools" | grep -qx update_dashboard; then
+            echo "update_dashboard is listed despite ACCESS_MODE=restricted" >&2
+            exit 1
+          fi
+
+          echo "search_dashboards finds the dashboard in Grafana"
+          tool 8000 search_dashboards '{"query":"CI Boot"}' \
+            | jq -e '.dashboards[] | select(.title == "CI Boot Dashboard")' >/dev/null
+
+          echo "list_datasources sees the datasource in Grafana"
+          tool 8000 list_datasources \
+            | jq -e '.datasources[] | select(.name == "ci-prometheus")' >/dev/null
+
+          echo "the token server reaches Grafana as the service account"
+          [ "$(tool 8000 user_info | jq -r .login)" = sa-1-ci-mcp ]
+
+          echo "the basic auth server reaches Grafana as admin"
+          [ "$(tool 8001 user_info | jq -r .login)" = admin ]
+
+          echo "unrestricted access lists the write tools"
+          call 8001 '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+            | jq -r '.result.tools[].name' | grep -qx update_dashboard
+
+      - name: mcp logs on failure
+        if: failure()
+        run: |
+          cat responses.log || true
+          docker logs mcp || true
+          docker logs mcp-basic || true
+          docker logs grafana || true
 
   # The gateway's nginx config is rendered at container start, not at build
   # time, so a broken template passes the image build and only fails once it
